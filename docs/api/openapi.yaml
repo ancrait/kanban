@@ -1,0 +1,976 @@
+openapi: 3.0.3
+info:
+  title: Kanban Core API
+  version: 0.1.0-draft.1
+  description: |
+    Пропозиція контракту v0.1-core для етапів A0–A1. Backend ще не реалізований.
+    Детальні домовленості та сценарії: README.md у цій директорії.
+    У core дошки приватні, роль користувача завжди OWNER.
+    UTC timestamps, UUID, JSON camelCase. Усі відповіді: Cache-Control: no-store.
+    PATCH змінює лише передані поля; null для цих полів заборонений.
+    version у запиті — остання відома клієнтові версія відповідної сутності.
+    Чужий або відсутній ресурс повертає однаковий 404 після перевірки автентифікації.
+servers:
+  - url: /api/v1
+    description: Same-origin; локально використовується Vite proxy
+tags:
+  - name: Auth
+  - name: Users
+  - name: Boards
+  - name: Columns
+  - name: Cards
+security:
+  - bearerAuth: []
+paths:
+  /auth/csrf:
+    get:
+      tags: [Auth]
+      operationId: getCsrfToken
+      summary: Отримати CSRF-токен для auth-запитів
+      description: |
+        Повертає токен і встановлює відповідну cookie. Викликати перед auth POST
+        та повторно після register/login/logout. credentials: include.
+      security: []
+      responses:
+        '200':
+          description: CSRF-токен; відповідь не кешується
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/CsrfCookie'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CsrfResponse'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: Зареєструватися й одразу увійти
+      description: Створює користувача та refresh-сесію. Email-підтвердження не входить у core.
+      security:
+        - csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Користувач і сесія створені
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/RefreshCookie'
+            Location:
+              schema: {type: string, example: /api/v1/users/me}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/CsrfForbidden'
+        '409':
+          description: EMAIL_ALREADY_EXISTS
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Увійти за email і паролем
+      security:
+        - csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/Authenticated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: INVALID_CREDENTIALS; однакова відповідь для невідомого email і неправильного пароля
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          $ref: '#/components/responses/CsrfForbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshSession
+      summary: Оновити access-токен та ротувати refresh-токен
+      description: |
+        Без request body та без вимоги чинного access-токена.
+        Refresh читається виключно з HttpOnly cookie; новий повертається в Set-Cookie.
+        Повторне використання старого refresh відкликає відповідну сім'ю сесій.
+      security:
+        - refreshCookie: []
+          csrfToken: []
+      responses:
+        '200':
+          $ref: '#/components/responses/Authenticated'
+        '401':
+          description: REFRESH_INVALID; cookie відсутня, прострочена, відкликана або повторно використана
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/ClearedRefreshCookie'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          $ref: '#/components/responses/CsrfForbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Відкликати поточну refresh-сесію та видалити cookie
+      description: |
+        Access-токен не потрібен. За відсутньої або вже відкликаної сесії також 204,
+        якщо CSRF-перевірка успішна. Видані access JWT чинні до завершення їх TTL.
+      security:
+        - csrfToken: []
+      responses:
+        '204':
+          description: Сесію відкликано або її вже немає; response body відсутній
+          headers:
+            Set-Cookie:
+              $ref: '#/components/headers/ClearedRefreshCookie'
+        '403':
+          $ref: '#/components/responses/CsrfForbidden'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /users/me:
+    get:
+      tags: [Users]
+      operationId: getCurrentUser
+      summary: Отримати профіль поточного користувача
+      responses:
+        '200':
+          description: Профіль
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /boards:
+    get:
+      tags: [Boards]
+      operationId: listBoards
+      summary: Отримати сторінку власних дошок
+      description: Фіксоване сортування updatedAt DESC, id ASC; без довільного параметра sort у core.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: Сторінка; items може бути порожнім
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoardPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    post:
+      tags: [Boards]
+      operationId: createBoard
+      summary: Створити приватну дошку
+      description: Власник береться з access-токена; початкова version = 0.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBoardRequest'
+      responses:
+        '201':
+          description: Дошка без колонок створена
+          headers:
+            Location:
+              schema: {type: string, example: /api/v1/boards/11111111-1111-4111-8111-111111111111}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Board'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /boards/{boardId}:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    get:
+      tags: [Boards]
+      operationId: getBoard
+      summary: Отримати дошку з усіма колонками та картками
+      description: |
+        Узгоджений snapshot на момент читання. Порядок масивів columns і cards —
+        порядок відображення. Технічні rank/position назовні не передаються.
+        Core-ліміти: 50 колонок і 1000 карток на дошку.
+      responses:
+        '200':
+          description: Snapshot дошки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BoardSnapshot'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    patch:
+      tags: [Boards]
+      operationId: updateBoard
+      summary: Оновити назву або опис дошки
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateBoardRequest'
+      responses:
+        '200':
+          description: Оновлені метадані дошки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Board'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    delete:
+      tags: [Boards]
+      operationId: deleteBoard
+      summary: Видалити дошку з її колонками та картками
+      parameters:
+        - $ref: '#/components/parameters/ExpectedVersion'
+      responses:
+        '204':
+          description: Дошку видалено; response body відсутній
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /boards/{boardId}/columns:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+    post:
+      tags: [Columns]
+      operationId: createColumn
+      summary: Додати колонку в кінець дошки
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateColumnRequest'
+      responses:
+        '201':
+          description: Колонку створено; початкова version = 0
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Column'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /boards/{boardId}/columns/{columnId}:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+      - $ref: '#/components/parameters/ColumnId'
+    patch:
+      tags: [Columns]
+      operationId: updateColumn
+      summary: Перейменувати колонку
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateColumnRequest'
+      responses:
+        '200':
+          description: Оновлена колонка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Column'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    delete:
+      tags: [Columns]
+      operationId: deleteColumn
+      summary: Видалити порожню колонку
+      description: Колонка з картками повертає 409 COLUMN_NOT_EMPTY; каскадного видалення карток немає.
+      parameters:
+        - $ref: '#/components/parameters/ExpectedVersion'
+      responses:
+        '204':
+          description: Колонку видалено; response body відсутній
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /boards/{boardId}/columns/{columnId}/move:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+      - $ref: '#/components/parameters/ColumnId'
+    post:
+      tags: [Columns]
+      operationId: moveColumn
+      summary: Змінити порядок колонок дошки
+      description: |
+        Сусіди перевіряються після виключення переміщуваної колонки зі списку.
+        null позначає межу; обидва null допустимі лише для порожнього залишку.
+        Застарілий порядок повертає 409 MOVE_CONFLICT.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MoveColumnRequest'
+      responses:
+        '200':
+          description: Колонка з актуальною version; після успіху слід оновити snapshot дошки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Column'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /boards/{boardId}/columns/{columnId}/cards:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+      - $ref: '#/components/parameters/ColumnId'
+    post:
+      tags: [Cards]
+      operationId: createCard
+      summary: Додати картку в кінець колонки
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCardRequest'
+      responses:
+        '201':
+          description: Картку створено; початкова version = 0
+          headers:
+            Location:
+              schema: {type: string, example: /api/v1/boards/11111111-1111-4111-8111-111111111111/cards/44444444-4444-4444-8444-444444444444}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Card'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /boards/{boardId}/cards/{cardId}:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+      - $ref: '#/components/parameters/CardId'
+    get:
+      tags: [Cards]
+      operationId: getCard
+      summary: Отримати одну картку
+      responses:
+        '200':
+          description: Картка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Card'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    patch:
+      tags: [Cards]
+      operationId: updateCard
+      summary: Оновити назву або опис картки
+      description: Колонка й порядок змінюються виключно через move.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCardRequest'
+      responses:
+        '200':
+          description: Оновлена картка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Card'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    delete:
+      tags: [Cards]
+      operationId: deleteCard
+      parameters:
+        - $ref: '#/components/parameters/ExpectedVersion'
+      summary: Видалити картку
+      responses:
+        '204':
+          description: Картку видалено; response body відсутній
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+  /boards/{boardId}/cards/{cardId}/move:
+    parameters:
+      - $ref: '#/components/parameters/BoardId'
+      - $ref: '#/components/parameters/CardId'
+    post:
+      tags: [Cards]
+      operationId: moveCard
+      summary: Перемістити картку в межах дошки
+      description: |
+        Сервер сам визначає rank. targetColumnId належить цій дошці.
+        Сусіди мають бути суміжними в цільовій колонці після виключення картки,
+        що переміщується. Застарілий порядок повертає 409 MOVE_CONFLICT.
+        Успішна операція атомарна; перенесення між дошками не підтримується.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MoveCardRequest'
+      responses:
+        '200':
+          description: Картка з актуальними columnId і version; після успіху оновити snapshot дошки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Card'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/AccessUnauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access JWT у Authorization; зберігається frontend лише в пам'яті.
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: kanban_refresh
+      description: 'HttpOnly cookie; браузер надсилає її автоматично з credentials: include.'
+    csrfToken:
+      type: apiKey
+      in: header
+      name: X-CSRF-TOKEN
+      description: Токен із GET /auth/csrf; сервер також звіряє відповідну CSRF cookie.
+  headers:
+    RefreshCookie:
+      description: |
+        Встановлення/ротація refresh cookie. Production: HttpOnly; Secure;
+        SameSite=Lax; Path=/api/v1/auth; Max-Age=604800; без Domain.
+        При потребі змінити CSRF cookie сервер надсилає окремий Set-Cookie,
+        а не об'єднує кілька cookie через кому. Значення нижче — лише приклад.
+      schema:
+        type: string
+        example: kanban_refresh=opaque-secret; Path=/api/v1/auth; Max-Age=604800; HttpOnly; Secure; SameSite=Lax
+    ClearedRefreshCookie:
+      description: Видаляє cookie з тим самим Path і атрибутами, що при встановленні.
+      schema:
+        type: string
+        example: kanban_refresh=; Path=/api/v1/auth; Max-Age=0; HttpOnly; Secure; SameSite=Lax
+    CsrfCookie:
+      description: CSRF cookie; HttpOnly; Secure; SameSite=Lax; Path=/api/v1/auth; без Domain.
+      schema:
+        type: string
+        example: kanban_csrf=csrf-secret; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Lax
+  parameters:
+    BoardId:
+      name: boardId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    ColumnId:
+      name: columnId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    CardId:
+      name: cardId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    ExpectedVersion:
+      name: version
+      in: query
+      required: true
+      description: Версія ресурсу з останньої відповіді; DELETE не має request body.
+      schema:
+        $ref: '#/components/schemas/Version'
+    Page:
+      name: page
+      in: query
+      schema: {type: integer, format: int32, minimum: 0, default: 0}
+    Size:
+      name: size
+      in: query
+      schema: {type: integer, format: int32, minimum: 1, maximum: 100, default: 20}
+  responses:
+    Authenticated:
+      description: Access-токен, користувач і нова refresh cookie
+      headers:
+        Set-Cookie:
+          $ref: '#/components/headers/RefreshCookie'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AuthResponse'
+    BadRequest:
+      description: VALIDATION_FAILED або INVALID_REQUEST; невалідний JSON, поля чи параметри
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    AccessUnauthorized:
+      description: ACCESS_TOKEN_MISSING, ACCESS_TOKEN_INVALID або ACCESS_TOKEN_EXPIRED
+      headers:
+        WWW-Authenticate:
+          schema: {type: string, example: Bearer}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    CsrfForbidden:
+      description: CSRF_INVALID; auth-запит не виконаний
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: RESOURCE_NOT_FOUND; ресурс відсутній, чужий або не належить ресурсу в URL
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: VERSION_CONFLICT, MOVE_CONFLICT, COLUMN_NOT_EMPTY або BOARD_LIMIT_REACHED
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: RATE_LIMITED; почекати вказану кількість секунд
+      headers:
+        Retry-After:
+          schema: {type: integer, minimum: 1, example: 30}
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnexpectedError:
+      description: Непередбачена серверна помилка; без stack trace та секретів
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Version:
+      type: integer
+      format: int64
+      minimum: 0
+      maximum: 9007199254740991
+      example: 0
+      description: Версія конкретної сутності; JSON number у безпечному для JavaScript діапазоні.
+    Title:
+      type: string
+      minLength: 1
+      maxLength: 200
+      pattern: '\S'
+      example: Реалізувати авторизацію
+      description: Обрізаємо пробіли з країв; після цього рядок не може бути порожнім.
+    Description:
+      type: string
+      maxLength: 10000
+      example: Реєстрація, вхід та оновлення сесії.
+      description: Звичайний текст зі збереженням переносів; порожній рядок очищує опис, null заборонений.
+    Email:
+      type: string
+      format: email
+      maxLength: 254
+      example: developer@example.com
+      description: Перед перевіркою обрізаємо пробіли та переводимо в нижній регістр.
+    Password:
+      type: string
+      format: password
+      minLength: 12
+      maxLength: 72
+      writeOnly: true
+      x-maxUtf8Bytes: 72
+      description: Не обрізаємо й не нормалізуємо; додатково максимум 72 UTF-8 байти через BCrypt.
+    User:
+      type: object
+      required: [id, email, displayName, createdAt]
+      properties:
+        id: {type: string, format: uuid, example: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'}
+        email:
+          $ref: '#/components/schemas/Email'
+        displayName: {type: string, minLength: 2, maxLength: 50, example: Олексій}
+        createdAt: {type: string, format: date-time, example: '2026-10-22T09:00:00Z'}
+    CsrfResponse:
+      type: object
+      required: [token, headerName]
+      properties:
+        token: {type: string, minLength: 1}
+        headerName: {type: string, enum: [X-CSRF-TOKEN]}
+    AuthResponse:
+      type: object
+      required: [accessToken, tokenType, expiresIn, user]
+      properties:
+        accessToken: {type: string, minLength: 1, description: Access JWT; refresh у JSON відсутній.}
+        tokenType: {type: string, enum: [Bearer]}
+        expiresIn: {type: integer, minimum: 1, example: 900, description: TTL access-токена в секундах.}
+        user:
+          $ref: '#/components/schemas/User'
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password, displayName]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        password:
+          $ref: '#/components/schemas/Password'
+        displayName:
+          type: string
+          minLength: 2
+          maxLength: 50
+          pattern: '\S'
+          example: Олексій
+          description: Обрізаємо пробіли з країв перед перевіркою довжини.
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        password:
+          $ref: '#/components/schemas/Password'
+    Board:
+      type: object
+      required: [id, title, description, role, version, createdAt, updatedAt]
+      properties:
+        id: {type: string, format: uuid, example: '11111111-1111-4111-8111-111111111111'}
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/Description'
+        role:
+          type: string
+          enum: [OWNER, EDITOR, VIEWER]
+          example: OWNER
+          description: Роль поточного користувача; у core завжди OWNER, інші ролі з A2.
+        version:
+          $ref: '#/components/schemas/Version'
+        createdAt: {type: string, format: date-time, example: '2026-10-22T09:00:00Z'}
+        updatedAt:
+          type: string
+          format: date-time
+          example: '2026-10-22T09:00:00Z'
+          description: Час зміни метаданих дошки; не час останньої зміни будь-якої картки.
+    Column:
+      type: object
+      required: [id, boardId, title, version, createdAt, updatedAt]
+      properties:
+        id: {type: string, format: uuid, example: '22222222-2222-4222-8222-222222222222'}
+        boardId: {type: string, format: uuid, example: '11111111-1111-4111-8111-111111111111'}
+        title:
+          $ref: '#/components/schemas/Title'
+        version:
+          $ref: '#/components/schemas/Version'
+        createdAt: {type: string, format: date-time, example: '2026-10-22T09:00:00Z'}
+        updatedAt: {type: string, format: date-time, example: '2026-10-22T09:00:00Z'}
+    Card:
+      type: object
+      required: [id, boardId, columnId, title, description, version, createdAt, updatedAt]
+      properties:
+        id: {type: string, format: uuid, example: '44444444-4444-4444-8444-444444444444'}
+        boardId: {type: string, format: uuid, example: '11111111-1111-4111-8111-111111111111'}
+        columnId: {type: string, format: uuid, example: '22222222-2222-4222-8222-222222222222'}
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/Description'
+        version:
+          $ref: '#/components/schemas/Version'
+        createdAt: {type: string, format: date-time, example: '2026-10-22T09:00:00Z'}
+        updatedAt: {type: string, format: date-time, example: '2026-10-22T09:00:00Z'}
+    ColumnWithCards:
+      allOf:
+        - $ref: '#/components/schemas/Column'
+        - type: object
+          required: [cards]
+          properties:
+            cards:
+              type: array
+              maxItems: 1000
+              description: У порядку відображення; порожня колонка повертає [].
+              items:
+                $ref: '#/components/schemas/Card'
+    BoardSnapshot:
+      allOf:
+        - $ref: '#/components/schemas/Board'
+        - type: object
+          required: [columns]
+          properties:
+            columns:
+              type: array
+              maxItems: 50
+              description: У порядку відображення; нова дошка повертає [].
+              items:
+                $ref: '#/components/schemas/ColumnWithCards'
+    BoardPage:
+      type: object
+      required: [items, page, size, totalElements, totalPages]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Board'
+        page: {type: integer, format: int32, minimum: 0, example: 0}
+        size: {type: integer, format: int32, minimum: 1, maximum: 100, example: 20}
+        totalElements: {type: integer, format: int64, minimum: 0, maximum: 9007199254740991, example: 1}
+        totalPages: {type: integer, format: int32, minimum: 0, example: 1}
+    CreateBoardRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          allOf:
+            - $ref: '#/components/schemas/Description'
+          default: ''
+    UpdateBoardRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 2
+      required: [version]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/Description'
+    CreateColumnRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          $ref: '#/components/schemas/Title'
+    UpdateColumnRequest:
+      type: object
+      additionalProperties: false
+      required: [version, title]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        title:
+          $ref: '#/components/schemas/Title'
+    MoveColumnRequest:
+      type: object
+      additionalProperties: false
+      required: [version, previousColumnId, nextColumnId]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        previousColumnId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Сусід зліва; null для початку списку.
+        nextColumnId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Сусід справа; null для кінця списку.
+    CreateCardRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          allOf:
+            - $ref: '#/components/schemas/Description'
+          default: ''
+    UpdateCardRequest:
+      type: object
+      additionalProperties: false
+      minProperties: 2
+      required: [version]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        title:
+          $ref: '#/components/schemas/Title'
+        description:
+          $ref: '#/components/schemas/Description'
+    MoveCardRequest:
+      type: object
+      additionalProperties: false
+      required: [version, targetColumnId, previousCardId, nextCardId]
+      properties:
+        version:
+          $ref: '#/components/schemas/Version'
+        targetColumnId:
+          type: string
+          format: uuid
+          example: '33333333-3333-4333-8333-333333333333'
+        previousCardId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Сусід зверху; null для початку колонки.
+        nextCardId:
+          type: string
+          format: uuid
+          nullable: true
+          description: Сусід знизу; null для кінця колонки.
+    FieldError:
+      type: object
+      required: [field, code, message]
+      properties:
+        field: {type: string, example: title}
+        code: {type: string, example: NOT_BLANK}
+        message: {type: string, example: Назва не може бути порожньою.}
+    Problem:
+      type: object
+      description: Problem Details із розширеннями; UI приймає також невідомі code та додаткові поля.
+      required: [type, title, status, detail, instance, code, traceId, errors]
+      properties:
+        type: {type: string, format: uri, example: 'about:blank'}
+        title: {type: string, example: Conflict}
+        status: {type: integer, minimum: 400, maximum: 599, example: 409}
+        detail: {type: string, example: Картка вже змінена. Оновіть дані та повторіть дію.}
+        instance: {type: string, example: /api/v1/boards/11111111-1111-4111-8111-111111111111/cards/44444444-4444-4444-8444-444444444444}
+        code: {type: string, pattern: '^[A-Z][A-Z0-9_]*$', example: VERSION_CONFLICT}
+        traceId: {type: string, minLength: 1, example: 4f9d82c0a1944b3a8e571a62d00c147c}
+        errors:
+          type: array
+          description: Для помилок без конкретного поля повертаємо [].
+          items:
+            $ref: '#/components/schemas/FieldError'
