@@ -1,6 +1,6 @@
 # Контракт backend ↔ frontend: v0.1-core
 
-**Статус: пропозиція для спільного погодження, реалізація відсутня.** Версія специфікації: `0.1.0-draft.1`.
+**Статус: draft; реалізовано Spring Security, `GET /auth/csrf`, `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout` і `GET /users/me`; endpoint дошок ще попереду.** Версія специфікації: `0.1.0-draft.2`. Rate limit (`429`) реалізовано; браузерна інтеграція ще не завершена.
 
 Машиночитане джерело — [openapi.yaml](./openapi.yaml). Цей документ пояснює домовленості та приклади. Контракт покриває A0–A1 з `Plan.md`: авторизацію, приватні дошки, колонки, картки та переміщення. Учасників, коментарі й realtime додаємо на відповідних етапах.
 
@@ -13,7 +13,7 @@
 - У PATCH відсутнє поле означає «не змінювати», `description: ""` означає «очистити». `null` заборонений, крім явно nullable ID сусідів у move.
 - Невідомі поля request body відхиляються. Frontend допускає додаткові поля у відповідях, щоб сумісні розширення не ламали клієнт.
 - `title`: 1–200 символів після обрізання пробілів із країв. `description`: до 10 000 символів, звичайний текст. Для лімітів рахуємо Unicode code points; UTF-16 `string.length` не завжди дає ту саму кількість.
-- Email нормалізується через trim і lowercase. Пароль не нормалізуємо: 12–72 символи й додатково не більше 72 UTF-8 байтів. Для frontend байтову довжину дає `new TextEncoder().encode(password).length`.
+- Email нормалізується через trim і lowercase. Новий пароль при реєстрації: 12–72 символи; при вході потрібен непорожній пароль без повторної перевірки мінімальної довжини. В обох випадках пароль не обрізаємо й не нормалізуємо, ліміт BCrypt — 72 UTF-8 байти. Для frontend байтову довжину дає `new TextEncoder().encode(password).length`.
 - Звичайні успішні відповіді не загортаємо в `{ data: ... }`. Для списку дошок є окремий об'єкт пагінації.
 - Персональні відповіді та auth-відповіді мають `Cache-Control: no-store`; кеш frontend керується TanStack Query.
 - У core роль завжди `OWNER`; `EDITOR` і `VIEWER` зарезервовані в DTO для A2, самі права цих ролей ще не реалізовані.
@@ -34,6 +34,8 @@ Access-токен передається як `Authorization: Bearer <accessToke
 У локальному профілі з HTTP допускається cookie без `Secure`; production завжди HTTPS із `Secure`. Це явна конфігурація середовища, а не залежність від поведінки конкретного браузера.
 
 Для всіх auth-запитів використовуємо `credentials: "include"`. Перед auth POST викликаємо `GET /auth/csrf`, отримуємо `{ "token": "...", "headerName": "X-CSRF-TOKEN" }` і передаємо токен у відповідному заголовку. Сервер звіряє його з CSRF cookie. Після register/login/logout отримуємо CSRF-токен повторно; налаштування Spring Security має підтримувати цей SPA-потік. Команди до дошок використовують лише Bearer, без автентифікації через cookie.
+
+Register, login і refresh мають локальний rate limit до операцій BCrypt і БД, після CSRF і валідації DTO. Типові ліміти: register — 5/IP за годину, login — 30/IP і 10/нормалізований email за 15 хвилин, refresh — 120/IP за хвилину. Успішні й невдалі спроби рахуються однаково; пороги налаштовуються. При `429 RATE_LIMITED` зачекати `Retry-After` секунд: cookie залишаються чинними й refresh не змінюється. Logout не обмежується цими лічильниками. Ліміти діють у межах одного процесу й скидаються при рестарті; подробиці конфігурації — у [backend README](../../backend/README.md).
 
 Приклад реєстрації:
 
@@ -207,22 +209,31 @@ POST /api/v1/boards/11111111-1111-4111-8111-111111111111/cards/44444444-4444-444
 
 ## 5. Формат помилок
 
-Content-Type: `application/problem+json`.
+Content-Type: `application/json`. Загальна помилка:
 
 ```json
 {
-  "type": "about:blank",
-  "title": "Conflict",
   "status": 409,
-  "detail": "Картка вже змінена. Оновіть дані та повторіть дію.",
-  "instance": "/api/v1/boards/11111111-1111-4111-8111-111111111111/cards/44444444-4444-4444-8444-444444444444",
+  "error": "Conflict",
   "code": "VERSION_CONFLICT",
-  "traceId": "4f9d82c0a1944b3a8e571a62d00c147c",
-  "errors": []
+  "message": "Картка вже змінена. Оновіть дані та повторіть дію.",
+  "timestamp": "2026-10-25T10:00:00Z"
 }
 ```
 
-`errors` для валідації, наприклад: `[{ "field": "title", "code": "NOT_BLANK", "message": "Назва не може бути порожньою." }]`. Для загальної помилки це `[]`.
+Для помилок `@Valid` request body замість `message` повертаємо `errors` — об'єкт із одним повідомленням для кожного поля:
+
+```json
+{
+  "status": 400,
+  "error": "Validation Failed",
+  "code": "VALIDATION_FAILED",
+  "errors": { "email": "Некоректний формат email." },
+  "timestamp": "2026-10-25T10:00:00Z"
+}
+```
+
+Некоректний JSON, параметри запиту та перевищення байтового ліміту пароля повертають загальну помилку `400 INVALID_REQUEST`. Непередбачені винятки мають загальне повідомлення без внутрішніх подробиць.
 
 | HTTP | code | Реакція frontend |
 |---|---|---|
@@ -231,14 +242,15 @@ Content-Type: `application/problem+json`.
 | 401 | `ACCESS_TOKEN_MISSING`, `ACCESS_TOKEN_INVALID`, `ACCESS_TOKEN_EXPIRED` | Один refresh, потім один повтор запиту |
 | 401 | `REFRESH_INVALID` | Очистити локальну сесію та запропонувати вхід |
 | 403 | `CSRF_INVALID` | Отримати новий CSRF; не запускати нескінченні повтори |
+| 403 | `ACCESS_DENIED` | Показати відсутність дозволу на операцію |
 | 404 | `RESOURCE_NOT_FOUND` | Показати недоступність ресурсу |
 | 409 | `EMAIL_ALREADY_EXISTS` | Помилка біля email у формі реєстрації |
 | 409 | `VERSION_CONFLICT`, `MOVE_CONFLICT` | Оновити дані, пояснити конфлікт |
 | 409 | `COLUMN_NOT_EMPTY`, `BOARD_LIMIT_REACHED` | Пояснити бізнес-обмеження |
 | 429 | `RATE_LIMITED` | Врахувати `Retry-After` у секундах |
-| 500 | `INTERNAL_ERROR` | Загальне повідомлення, traceId для діагностики |
+| 500 | `INTERNAL_ERROR` | Показати загальне повідомлення про збій |
 
-UI спирається на `code`, а не на текст `detail`; невідомий код або інша серверна помилка мають безпечне загальне відображення. Формат стосується також відповідей security filters, а не лише controller exceptions. Клієнт обробляє й не-JSON відповіді проксі при інфраструктурному збої.
+UI спирається на `code`, а не на текст `message`; невідомий код або інша серверна помилка мають безпечне загальне відображення. `errors` можна показати біля відповідних полів форми. Формат стосується також майбутніх відповідей security filters. Клієнт обробляє й не-JSON відповіді проксі при інфраструктурному збої.
 
 ## 6. Як починаємо працювати
 
@@ -253,5 +265,5 @@ UI спирається на `code`, а не на текст `detail`; неві�
 ## 7. Джерела формату й інтеграції
 
 - [OpenAPI 3.0.3](https://spec.openapis.org/oas/v3.0.3.html) — формат специфікації.
-- [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457.html) — Problem Details із нашими додатковими полями.
+- [ticket-booking-system — GlobalExceptionHandler](https://github.com/ancrait/ticket-booking-system/blob/master/backend/auth-service/src/main/java/com/sorokaandriy/auth_service/exception/GlobalExceptionHandler.java) — приклад простого advice та DTO помилок, на який орієнтуємося.
 - [Spring Security: CSRF](https://docs.spring.io/spring-security/reference/servlet/exploits/csrf.html) — інтеграція CSRF із SPA та оновлення токена після входу/виходу.
